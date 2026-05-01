@@ -1,0 +1,20 @@
+{
+  "name": "busy-adults-life-publisher",
+  "version": "1.0.0",
+  "description": "Auto-publish Busy Adults Life Reels to Instagram via Meta Graph API. Runs as GitHub Actions cron.",
+  "private": true,
+  "main": "publisher.js",
+  "scripts": {
+    "start": "node publisher.js",
+    "dry": "node publisher.js --dry-run",
+    "force": "node publisher.js --force",
+    "status": "node publisher.js --status"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

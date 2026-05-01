@@ -1,0 +1,67 @@
+name: Daily Instagram Publisher
+
+on:
+  schedule:
+    # Cron uses UTC. CEST = UTC+2 (summer), CET = UTC+1 (winter).
+    # 09:00 local CEST → 07:00 UTC
+    # 15:00 local CEST → 13:00 UTC
+    - cron: '0 7 * * *'
+    - cron: '0 13 * * *'
+  workflow_dispatch:           # manual trigger from GitHub UI
+    inputs:
+      force:
+        description: 'Bypass 5h dedup guard'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+      dry_run:
+        description: 'Dry-run only (no actual posting)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # needed to commit state file back
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Run publisher
+        env:
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          IG_USER_ID:        ${{ secrets.IG_USER_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.force }}" = "true" ]; then ARGS="$ARGS --force"; fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          node publisher.js $ARGS
+
+      - name: Commit state changes
+        if: ${{ inputs.dry_run != 'true' }}
+        run: |
+          if git diff --quiet .posted-shorts.json; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .posted-shorts.json
+          git commit -m "chore: update posted-shorts state $(date -u +%Y-%m-%d)"
+          git push
