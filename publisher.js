@@ -42,6 +42,23 @@ const DEDUP_HOURS = 5;
 const SHORTS_DIR = path.join(__dirname, 'shorts');
 const STATE_FILE = path.join(__dirname, '.posted-shorts.json');
 
+// strictEnc — encodeURIComponent leaves ', !, (, ), * unescaped, which makes
+// IG's URL fetcher choke when the filename contains them. Encode them manually.
+function strictEnc(str) {
+  return encodeURIComponent(str)
+    .replace(/'/g, '%27').replace(/!/g, '%21')
+    .replace(/\(/g, '%28').replace(/\)/g, '%29').replace(/\*/g, '%2A');
+}
+
+// REPO_RAW — when running in GitHub Actions, the shorts folder is also on
+// raw.githubusercontent.com. Serving directly from there avoids the broken
+// third-party file-host hop entirely (tmpfiles.org returned URLs IG could not
+// fetch — error 2207076 — from May 2 2026 onward; catbox.moe returned
+// 0-byte URLs around the same time).
+const REPO_RAW = process.env.REPO_RAW_URL ||
+  'https://raw.githubusercontent.com/gschmal9-dev/busy-adults-life-publisher/main/shorts/';
+
+
 const args = process.argv.slice(2);
 const DRY_RUN = args.includes('--dry-run');
 const FORCE   = args.includes('--force');
@@ -108,38 +125,94 @@ function compressForReels(srcPath) {
   return out;
 }
 
-// ─── tmpfiles.org upload ─────────────────────────────────────────────────────
-async function uploadToTmpfiles(localPath) {
-  const compressed = compressForReels(localPath);
-  const sizeMb = fs.statSync(compressed).size / (1024 * 1024);
-  if (sizeMb > TMPFILES_LIMIT_MB) throw new Error(`File ${sizeMb.toFixed(1)}MB > ${TMPFILES_LIMIT_MB}MB limit`);
-
+// ─── File upload (multi-host with fallback) ──────────────────────────────────
+// tmpfiles.org is primary but is known to rate-limit / serve HTML error pages
+// to GitHub Actions runner IPs. On any tmpfiles failure we fall back to
+// catbox.moe — far more reliable for cloud-runner uploads. IG just needs a
+// public, fetchable mp4 URL.
+function buildMultipartBody(filename, fileBuf, fieldName, extraFields) {
   const boundary = '----badl' + crypto.randomBytes(8).toString('hex');
+  const parts = [];
+  for (const [k, v] of Object.entries(extraFields || {})) {
+    parts.push(Buffer.from(
+      `--${boundary}
+Content-Disposition: form-data; name="${k}"
+
+${v}
+`, 'utf8'));
+  }
+  parts.push(Buffer.from(
+    `--${boundary}
+Content-Disposition: form-data; name="${fieldName}"; filename="${filename}"
+Content-Type: video/mp4
+
+`, 'utf8'));
+  parts.push(fileBuf);
+  parts.push(Buffer.from(`
+--${boundary}--
+`, 'utf8'));
+  return { boundary, body: Buffer.concat(parts) };
+}
+
+async function uploadToTmpfiles(compressed) {
   const filename = path.basename(compressed).replace(/[^a-zA-Z0-9._-]/g, '_');
   const fileBuf = fs.readFileSync(compressed);
-  const head = Buffer.from(
-    `--${boundary}\r\n` +
-    `Content-Disposition: form-data; name="file"; filename="${filename}"\r\n` +
-    `Content-Type: video/mp4\r\n\r\n`,
-    'utf8'
-  );
-  const tail = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8');
-  const body = Buffer.concat([head, fileBuf, tail]);
-
+  const { boundary, body } = buildMultipartBody(filename, fileBuf, 'file', null);
   log('  ', `tmpfiles.org upload (${Math.round(fileBuf.length/1024/1024)} MB)...`);
   const res = await request('https://tmpfiles.org/api/v1/upload', {
     method: 'POST',
     headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
-    body,
-    timeoutMs: 900_000,
+    body, timeoutMs: 900_000,
   });
+  const txt = res.body.toString();
   let json;
-  try { json = JSON.parse(res.body.toString()); }
-  catch { throw new Error(`tmpfiles non-JSON (${res.status}): ${res.body.toString().slice(0,300)}`); }
-  if (json.status !== 'success' || !json.data?.url) throw new Error(`tmpfiles upload failed: ${JSON.stringify(json).slice(0,400)}`);
+  try { json = JSON.parse(txt); }
+  catch { throw new Error(`tmpfiles non-JSON (HTTP ${res.status}): ${txt.slice(0,250)}`); }
+  if (json.status !== 'success' || !json.data?.url) {
+    throw new Error(`tmpfiles non-success (HTTP ${res.status}): ${JSON.stringify(json).slice(0,300)}`);
+  }
   let directUrl = json.data.url.replace('tmpfiles.org/', 'tmpfiles.org/dl/');
   if (directUrl.startsWith('http://')) directUrl = 'https://' + directUrl.slice(7);
   return directUrl;
+}
+
+async function uploadToCatbox(compressed) {
+  const filename = path.basename(compressed).replace(/[^a-zA-Z0-9._-]/g, '_');
+  const fileBuf = fs.readFileSync(compressed);
+  const { boundary, body } = buildMultipartBody(filename, fileBuf, 'fileToUpload', { reqtype: 'fileupload' });
+  log('  ', `catbox.moe upload (${Math.round(fileBuf.length/1024/1024)} MB)...`);
+  const res = await request('https://catbox.moe/user/api.php', {
+    method: 'POST',
+    headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}` },
+    body, timeoutMs: 900_000,
+  });
+  const txt = res.body.toString().trim();
+  if (res.status !== 200 || !txt.startsWith("https://files.catbox.moe/")) {
+    throw new Error(`catbox failed (HTTP ${res.status}): ${txt.slice(0,250)}`);
+  }
+  return txt;
+}
+
+async function uploadToHost(localPath) {
+  // Primary path: serve straight from raw.githubusercontent.com — the same
+  // commit this workflow runs from already contains the file. No upload step,
+  // no third-party host, IG fetches the mp4 via Content-Type:
+  // application/octet-stream and ingests it cleanly.
+  if (REPO_RAW) {
+    const url = REPO_RAW + strictEnc(path.basename(localPath));
+    log('  ', `using raw GitHub URL: ${url}`);
+    return url;
+  }
+  // Fallback: third-party hosts (kept for local dry-runs without a repo).
+  const compressed = compressForReels(localPath);
+  const sizeMb = fs.statSync(compressed).size / (1024 * 1024);
+  if (sizeMb > TMPFILES_LIMIT_MB) throw new Error(`File ${sizeMb.toFixed(1)}MB > ${TMPFILES_LIMIT_MB}MB limit`);
+  try {
+    return await uploadToCatbox(compressed);
+  } catch (e) {
+    log('⚠️ ', `catbox.moe failed: ${e.message}. Falling back to tmpfiles.org...`);
+  }
+  return await uploadToTmpfiles(compressed);
 }
 
 // ─── Instagram Graph API ─────────────────────────────────────────────────────
@@ -280,8 +353,8 @@ function alreadyPostedRecently(state) {
   console.log(caption);
   console.log('─────────────────────\n');
 
-  log('⬆️ ', 'Uploading to tmpfiles.org...');
-  const publicUrl = await uploadToTmpfiles(localPath);
+  log('⬆️ ', 'Uploading video to public host...');
+  const publicUrl = await uploadToHost(localPath);
   log('🔗', `Public URL: ${publicUrl.slice(0, 80)}...`);
 
   if (DRY_RUN) { log('🟡', 'Dry-run — caption + upload validated. Not posting.'); return; }

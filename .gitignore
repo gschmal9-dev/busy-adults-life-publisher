@@ -5,3 +5,6 @@ node_modules/
 logs/
 .DS_Store
 *.swp
+post-direct.js
+post-next.js
+.env
